@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
 import { getNeo4jSession } from "@/lib/neo4j";
+import fs from "fs";
+import path from "path";
+import OpenAI from "openai";
 
 export const runtime = "nodejs";
 
@@ -32,8 +35,68 @@ const ALLOWED_RELATIONSHIP_TYPES = [
   "BILLED_IN",
   "PAID_BY",
 ];
-const GEMINI_DEFAULT_MODEL = "gemini-2.0-flash";
-const GEMINI_FALLBACK_MODELS = ["gemini-2.0-flash"];
+const GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b";
+const GROQ_FALLBACK_MODELS = ["openai/gpt-oss-20b"];
+
+function getGroqClient() {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("Missing GROQ_API_KEY env var");
+
+  const g = globalThis;
+  const currentKey = g.__groqApiKey;
+  if (!g.__groqClient || currentKey !== apiKey) {
+    g.__groqClient = new OpenAI({
+      apiKey,
+      baseURL: "https://api.groq.com/openai/v1",
+    });
+    g.__groqApiKey = apiKey;
+  }
+  return g.__groqClient;
+}
+
+async function getDatasetFieldHints() {
+  const g = globalThis;
+  if (g.__datasetFieldHints) return g.__datasetFieldHints;
+
+  const root = process.cwd();
+  const datasetDir = path.join(root, "dataset");
+  const hints = [];
+
+  try {
+    const folders = await fs.promises.readdir(datasetDir, { withFileTypes: true });
+    for (const folder of folders) {
+      if (!folder.isDirectory()) continue;
+      const folderPath = path.join(datasetDir, folder.name);
+      const files = await fs.promises.readdir(folderPath, { withFileTypes: true });
+      const jsonl = files.filter((f) => f.isFile() && f.name.endsWith(".jsonl")).slice(0, 2);
+
+      const fieldSet = new Set();
+      for (const f of jsonl) {
+        const full = path.join(folderPath, f.name);
+        const text = await fs.promises.readFile(full, "utf8");
+        const line = text.split(/\r?\n/).find((l) => l.trim().length > 0);
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          for (const k of Object.keys(obj)) fieldSet.add(k);
+        } catch {
+          // ignore bad sample lines
+        }
+      }
+
+      const fields = Array.from(fieldSet).slice(0, 20);
+      if (fields.length > 0) {
+        hints.push(`${folder.name}: ${fields.join(", ")}`);
+      }
+    }
+  } catch {
+    // If dataset scan fails, we can still continue with schema-only prompt.
+  }
+
+  const fieldHints = hints.slice(0, 40).join("\n");
+  g.__datasetFieldHints = fieldHints;
+  return fieldHints;
+}
 
 function normalizeNeo4jPropertyValue(value) {
   if (value === null || value === undefined) return undefined;
@@ -181,74 +244,19 @@ function extractCypher(text) {
   return t;
 }
 
-function extractLikelyId(question) {
-  // Tries to capture ids like 90504204 / 80738040 / 9400000220 / S8907367001003
-  const matches = String(question ?? "").match(/[A-Za-z]?[A-Za-z0-9_-]{6,}/g) ?? [];
-  if (matches.length === 0) return null;
-  return matches[matches.length - 1];
+function sanitizeCypher(cypher) {
+  let out = String(cypher ?? "").replace(/```/g, "").trim();
+  out = out.replace(/;\s*$/, "");
+  return out;
 }
 
-function buildFallbackCypherFromQuestion(question) {
-  const q = String(question ?? "").toLowerCase();
-  const id = extractLikelyId(question);
-
-  if (id && (q.includes("billing") || q.includes("invoice"))) {
-    return {
-      cypher: `
-        MATCH (i:Invoice { invoiceId: $id })
-        OPTIONAL MATCH (d:Delivery)-[:BILLED_IN]->(i)
-        OPTIONAL MATCH (o:Order)-[:HAS_DELIVERY]->(d)
-        OPTIONAL MATCH (o)-[:PLACED_BY]->(c:Customer)
-        OPTIONAL MATCH (i)-[:PAID_BY]->(p:Payment)
-        RETURN i AS invoice, d AS delivery, o AS order, c AS customer, p AS payment
-        LIMIT 50
-      `,
-      params: { id },
-    };
-  }
-
-  if (id && (q.includes("salesorder") || q.includes("sales order") || q.includes("order"))) {
-    return {
-      cypher: `
-        MATCH (o:Order { orderId: $id })
-        OPTIONAL MATCH (o)-[:PLACED_BY]->(c:Customer)
-        OPTIONAL MATCH (o)-[:HAS_DELIVERY]->(d:Delivery)
-        OPTIONAL MATCH (d)-[:BILLED_IN]->(i:Invoice)
-        OPTIONAL MATCH (i)-[:PAID_BY]->(p:Payment)
-        RETURN o AS order, c AS customer, collect(DISTINCT d) AS deliveries, collect(DISTINCT i) AS invoices, collect(DISTINCT p) AS payments
-        LIMIT 1
-      `,
-      params: { id },
-    };
-  }
-
-  if (id && q.includes("customer")) {
-    return {
-      cypher: `
-        MATCH (c:Customer { customerId: $id })
-        OPTIONAL MATCH (o:Order)-[:PLACED_BY]->(c)
-        OPTIONAL MATCH (o)-[:HAS_DELIVERY]->(d:Delivery)
-        OPTIONAL MATCH (d)-[:BILLED_IN]->(i:Invoice)
-        RETURN c AS customer, collect(DISTINCT o) AS orders, collect(DISTINCT d) AS deliveries, collect(DISTINCT i) AS invoices
-        LIMIT 1
-      `,
-      params: { id },
-    };
-  }
-
-  if (q.includes("highest") && q.includes("billing") && q.includes("product")) {
-    return {
-      cypher: `
-        MATCH (p:Product)<-[:FOR_PRODUCT]-(:OrderItem)<-[:HAS_ITEM]-(:Order)-[:HAS_DELIVERY]->(:Delivery)-[:BILLED_IN]->(i:Invoice)
-        RETURN p, count(DISTINCT i.invoiceId) AS billingDocumentCount
-        ORDER BY billingDocumentCount DESC
-        LIMIT 20
-      `,
-      params: {},
-    };
-  }
-
-  return null;
+function extractLikelyId(question) {
+  // Tries to capture ids like 90504204 / 80738040 / 9400000220 / S8907367001003.
+  // Important: require at least one digit so words like "highest" are not treated as IDs.
+  const matches = String(question ?? "").match(/[A-Za-z]?[A-Za-z0-9_-]{6,}/g) ?? [];
+  const withDigit = matches.filter((m) => /\d/.test(m));
+  if (withDigit.length === 0) return null;
+  return withDigit[withDigit.length - 1];
 }
 
 function isQueryAllowed(cypher) {
@@ -299,77 +307,59 @@ function isQueryAllowed(cypher) {
   return usedLabels.size > 0 || allRelTypes.size > 0;
 }
 
-async function callGeminiGenerate(model, apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 256,
-    },
-  };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const textBody = await res.text();
-  let payload = null;
+async function callGroqGenerate(model, prompt) {
+  const client = getGroqClient();
   try {
-    payload = JSON.parse(textBody);
-  } catch {
-    // keep raw text in error path
+    const response = await client.responses.create({
+      model,
+      input: prompt,
+    });
+    return extractCypher(response.output_text ?? "");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const e = new Error(`Groq request failed (${model}): ${message}`);
+    e.status = err?.status;
+    throw e;
   }
-
-  if (!res.ok) {
-    const message = payload ? JSON.stringify(payload) : textBody;
-    const error = new Error(`Gemini request failed (${model}): ${res.status} ${message}`);
-    error.status = res.status;
-    throw error;
-  }
-
-  const text =
-    payload?.candidates?.[0]?.content?.parts?.[0]?.text ??
-    payload?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ??
-    "";
-
-  return extractCypher(text);
 }
 
-async function callGeminiToCypher(question) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("Missing GEMINI_API_KEY env var");
-  }
-
-  const configuredModel = process.env.GEMINI_MODEL ?? GEMINI_DEFAULT_MODEL;
+async function callGroqToCypher(question, datasetFieldHints) {
+  const configuredModel = process.env.GROQ_MODEL ?? GROQ_DEFAULT_MODEL;
 
   const prompt = `Convert the following natural language question into a Cypher query for Neo4j.
 
 Rules:
-- Use only these node types: Order, Customer, Delivery, Invoice, Payment, Product
+- Use only these node types: Order, OrderItem, Customer, Delivery, Invoice, Payment, Product
 - Use relationships:
   (Order)-[:PLACED_BY]->(Customer)
   (Order)-[:HAS_DELIVERY]->(Delivery)
+  (Order)-[:HAS_ITEM]->(OrderItem)
+  (OrderItem)-[:FOR_PRODUCT]->(Product)
   (Delivery)-[:BILLED_IN]->(Invoice)
   (Invoice)-[:PAID_BY]->(Payment)
 - Prefer read-only aggregations and path tracing.
 - When possible, return relevant nodes or paths so UI can highlight matched graph entities.
+- Common id properties:
+  Order.orderId, Customer.customerId, Delivery.deliveryId, Invoice.invoiceId, Payment.paymentId, Product.productId
+- Common payment amount properties:
+  Payment.amountInTransactionCurrency, Payment.amountInCompanyCodeCurrency
+- Use OPTIONAL MATCH when links may be missing.
 - Return ONLY the Cypher query
 - Do NOT explain anything
 
 Question:
-${question}`;
+${question}
+
+Dataset fields (discovered from /dataset samples; use these names when relevant):
+${datasetFieldHints || "N/A"}`;
 
   // Try configured model first. If unavailable, fall back automatically.
-  const modelsToTry = [configuredModel, ...GEMINI_FALLBACK_MODELS.filter((m) => m !== configuredModel)];
+  const modelsToTry = [configuredModel, ...GROQ_FALLBACK_MODELS.filter((m) => m !== configuredModel)];
   let lastError = null;
 
   for (const model of modelsToTry) {
     try {
-      const cypher = await callGeminiGenerate(model, apiKey, prompt);
+      const cypher = await callGroqGenerate(model, prompt);
       if (cypher.trim()) return cypher;
     } catch (err) {
       lastError = err;
@@ -381,7 +371,40 @@ ${question}`;
     }
   }
 
-  throw lastError ?? new Error("Failed to generate Cypher query from Gemini.");
+  throw lastError ?? new Error("Failed to generate Cypher query from Groq.");
+}
+
+async function repairCypherWithGroq(question, badCypher, failureReason) {
+  const configuredModel = process.env.GROQ_MODEL ?? GROQ_DEFAULT_MODEL;
+  const prompt = `Fix this Cypher query for Neo4j.
+
+User question:
+${question}
+
+Broken query:
+${badCypher}
+
+Failure:
+${failureReason}
+
+Rules:
+- Output ONLY corrected Cypher
+- Read-only query only (MATCH/OPTIONAL MATCH/RETURN/WITH/ORDER BY/LIMIT)
+- Use only labels: Order, OrderItem, Customer, Delivery, Invoice, Payment, Product
+- Use only relationships: PLACED_BY, HAS_DELIVERY, HAS_ITEM, FOR_PRODUCT, BILLED_IN, PAID_BY
+`;
+
+  const modelsToTry = [configuredModel, ...GROQ_FALLBACK_MODELS.filter((m) => m !== configuredModel)];
+  for (const model of modelsToTry) {
+    try {
+      const repaired = await callGroqGenerate(model, prompt);
+      const s = sanitizeCypher(repaired);
+      if (s) return s;
+    } catch {
+      // continue
+    }
+  }
+  return null;
 }
 
 export async function POST(req) {
@@ -405,45 +428,94 @@ export async function POST(req) {
       });
     }
 
+    const datasetFieldHints = await getDatasetFieldHints();
     let cypher = "";
-    let params = {};
+    const params = {};
+    let translatedBy = "groq";
+
+    // Groq-first NLP translation for all dataset questions.
     try {
-      cypher = await callGeminiToCypher(question);
-    } catch {
-      const fallback = buildFallbackCypherFromQuestion(question);
-      if (!fallback) {
-        return NextResponse.json(
-          {
-            answer:
-              "I could not translate that into a supported dataset query right now. Please rephrase using order, delivery, invoice, payment, customer, or product terms.",
-            cypher: null,
-            data: [],
-            highlightNodeIds: [],
-          },
-          { status: 200 }
-        );
-      }
-      cypher = fallback.cypher;
-      params = fallback.params;
+      cypher = await callGroqToCypher(question, datasetFieldHints);
+      cypher = sanitizeCypher(cypher);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return NextResponse.json(
+        {
+          answer:
+            `I could not translate that query via Groq right now. ${reason}`,
+          cypher: null,
+          data: [],
+          highlightNodeIds: [],
+          translatedBy: "none",
+        },
+        { status: 200 }
+      );
     }
 
     // Normalize output.
-    cypher = cypher.replace(/```/g, "").trim();
-    cypher = cypher.replace(/;\s*$/, "");
+    cypher = sanitizeCypher(cypher);
+
+    if (!isQueryAllowed(cypher)) {
+      // Try one LLM repair attempt before falling back.
+      if (translatedBy === "groq") {
+        const repaired = await repairCypherWithGroq(
+          question,
+          cypher,
+          "Guardrail validation failed (unsafe labels/relationships or non-read-only query)"
+        );
+        if (repaired && isQueryAllowed(repaired)) {
+          cypher = repaired;
+        }
+      }
+    }
 
     if (!isQueryAllowed(cypher)) {
       return NextResponse.json({
         answer:
-          "I could not translate that into a supported dataset query right now. Please rephrase using order, delivery, invoice, payment, customer, or product terms.",
+          "The generated query was outside the allowed dataset graph scope. Please rephrase your question.",
         cypher: null,
         data: [],
         highlightNodeIds: [],
+        translatedBy: "none",
       });
     }
 
     const session = getNeo4jSession();
     try {
-      const result = await session.run(cypher, params);
+      let result;
+      try {
+        result = await session.run(cypher, params);
+      } catch (queryErr) {
+        // One repair attempt on Neo4j execution errors when source was Groq.
+        if (translatedBy === "groq") {
+          const reason = queryErr instanceof Error ? queryErr.message : String(queryErr);
+          const repaired = await repairCypherWithGroq(question, cypher, reason);
+          if (repaired && isQueryAllowed(repaired)) {
+            cypher = repaired;
+            result = await session.run(cypher, params);
+          } else {
+            const reason = queryErr instanceof Error ? queryErr.message : String(queryErr);
+            return NextResponse.json({
+              answer:
+                `The generated query could not be executed on the dataset. ${reason}`,
+              cypher: null,
+              data: [],
+              highlightNodeIds: [],
+              translatedBy: "none",
+            });
+          }
+        } else {
+          const reason = queryErr instanceof Error ? queryErr.message : String(queryErr);
+          return NextResponse.json({
+            answer:
+              `The generated query could not be executed on the dataset. ${reason}`,
+            cypher: null,
+            data: [],
+            highlightNodeIds: [],
+            translatedBy: "none",
+          });
+        }
+      }
       const keys = Array.isArray(result?.records?.[0]?.keys)
         ? result.records[0].keys
         : [];
@@ -458,7 +530,7 @@ export async function POST(req) {
 
       const answer = buildGroundedAnswer(data);
       const highlightNodeIds = await resolveHighlightNodeIds(session, data, question);
-      return NextResponse.json({ answer, cypher, data, highlightNodeIds });
+      return NextResponse.json({ answer, cypher, data, highlightNodeIds, translatedBy });
     } finally {
       await session.close();
     }
